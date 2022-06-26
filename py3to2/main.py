@@ -70,4 +70,3 @@ def main():
     args = parser.parse_args()
     args.func(args)
 
-print(112132123123123123)
