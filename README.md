@@ -10,9 +10,14 @@ pip install git+https://github.com/wayhowang/py3to2.git@main
 
 Says you write python 3 code in `DIR_PY3`, and you want to the converter write code in `DIR_PY2`.
 
-py3to2 initialize ./build
+```
+cp -r ${DIR_PY3} ${DIR_PY2}   # copy the directory first anyway
+py3to2 convert-all ${DIR_PY2}
 ```
 
+Other options:
+* involve `py3to2 convert [--output OUTPUT] <source>` to convert a single file
+* involve `py3to2 initialize <directory>` to initialize a build target directory
 
 ## Description
 
@@ -32,7 +37,3 @@ It is a converter that supports very limited python2 features.
 ## Disclamer
 The project is mainly written for self-use. It is `not` well tested and runs pretty slowly.
 But this tool may be helpful if you have to write code for python 2.7 unfortunately.
-
-
-
-"""
