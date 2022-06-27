@@ -11,7 +11,7 @@ setup(
         author_email="<wweihao@outlook.com>",
         description=DESCRIPTION,
         packages=find_packages(),
-        install_requires=['libcst', '3to2'], 
+        install_requires=['libcst', '3to2', 'pytype'], 
         keywords=['python'], 
         entry_points ={
             'console_scripts': [

@@ -8,6 +8,10 @@ import argparse
 import os
 import base64
 
+import pytype
+from . import expression_type
+import pytype.pytd.pytd as pytd
+
 
 def get_latest_comment(node: cst.SimpleStatementLine):
     for line in reversed(node.leading_lines):
@@ -61,9 +65,10 @@ class RemoveTypehint(cst.CSTTransformer):
         'typing_extensions': '_py3to2_typing_extensions'
     }
 
-    def __init__(self, relative_dots: int):
+    def __init__(self, relative_dots: int, type_info: Dict[expression_type.CodePosition, pytd.Type]):
         super().__init__()
         self._relative_dots = relative_dots
+        self._type_info = type_info
 
     # ==========================================
     # 删除变量、参数、函数的类型提示
@@ -141,6 +146,84 @@ class RemoveTypehint(cst.CSTTransformer):
             else:
                 return updated_node
 
+    # ==========================================
+    # 删除 Generic[T]，BaseClass[T] 之类的表达式的 `[T]`
+    
+    def leave_Subscript(self, original_node: cst.Subscript, updated_node: cst.Subscript) -> cst.BaseExpression:
+        # 以 pytypes 语言描述
+        # 条件：
+        # 1. 数据类型是 GenericType
+        # 2. base_type == ClassType(builtin.type)
+        # 3. parameters is not empty, is not None
+        # 4. for all parameter in parameters
+        # 5.     parameter 是 GenericType
+        # 动作：
+        #        parameter.parameters=(AnythingType(), )
+
+        # 以 libcst 语言描述
+        """
+        Subscript(
+          value=Name(id='Generic', ctx=Load()),
+          slice=Name(id='T', ctx=Load()),
+          ctx=Load()) --->
+        Name(id='B', ctx=Load())
+        """
+
+        if not original_node.value:
+            return updated_node
+
+        cst_position = self.get_metadata(cstmeta.PositionProvider, original_node.value)
+        if not cst_position:
+            return updated_node
+
+        position = expression_type.CodePosition(
+            cst_position.start.line, cst_position.start.column, 
+            cst_position.end.line, cst_position.end.column
+        )
+
+
+        pytype_type = self._type_info.get(position, None)
+        if not isinstance(pytype_type, pytd.GenericType):
+            return updated_node
+
+        if not isinstance(pytype_type.base_type, pytd.ClassType):
+            return updated_node
+
+        if pytype_type.base_type.name != 'builtins.type':
+            return updated_node
+
+        return updated_node.value
+
+    def leave_ClassDef(self, original_node: cst.ClassDef, updated_node: cst.ClassDef) -> cst.ClassDef:
+        assert(len(original_node.bases) == len(updated_node.bases))
+        
+        new_bases = []
+        for base, new_base in zip(original_node.bases, updated_node.bases):
+            cst_position = self.get_metadata(cstmeta.PositionProvider, base.value)
+            if not cst_position:
+                new_bases.append(new_base)
+                continue
+            position = expression_type.CodePosition(
+                cst_position.start.line, cst_position.start.column, 
+                cst_position.end.line, cst_position.end.column
+            )
+            pytype_type = self._type_info.get(position, None)
+  
+            if (not pytype_type or 
+                not isinstance(pytype_type, pytd.GenericType) or 
+                not isinstance(pytype_type.base_type, pytd.ClassType) or 
+                not pytype_type.base_type.name == 'builtins.type' or 
+                not pytype_type.parameters):
+
+                new_bases.append(new_base)
+                continue
+
+            real_type = pytype_type.parameters[0]
+            if not real_type.name == 'typing.Generic':
+                new_bases.append(new_base)
+                continue 
+        
+        return updated_node.with_changes(bases=new_bases)
 
 # call after RemoveTypehint
 class RemoveName(cst.CSTTransformer):
@@ -186,16 +269,16 @@ def get_relative_dots(code_path: str, directory: str) -> int:
 
 
 def apply_libcst_change(code: str, code_path: str, module_directory: str) -> str:
-    # libcst 提供的 FullyQualifiedNameProvider 不知道怎麽 import 系統庫~ 文檔也不多
-    # 内部是通過跨進程調用的方式搞，似乎也不太靠譜，容易出問題
-    # 所以先用 jedi 了
 
-    cst_tree = cst.parse_module(code)
+    relative_dots = get_relative_dots(code_path, module_directory)
+    types = expression_type.get_expression_types(code)
 
-    # 因为要用 JEDI 的关系，需要保持语法树和源代码一致
+    cst_tree: Any = cst.parse_module(code)
+
+    # 因为要用 pytype 的关系，需要保持语法树和源代码一致
     # 当然。。codegen + parse 都走一遍也不是不可以了。。
-    # cst_tree = cst.MetadataWrapper(cst_tree)
-    cst_tree = cst_tree.visit(RemoveTypehint(get_relative_dots(code_path, module_directory)))    
+    cst_tree = cst.MetadataWrapper(cst_tree)
+    cst_tree = cst_tree.visit(RemoveTypehint(relative_dots=relative_dots, type_info=types))
     cst_tree = cst_tree.visit(AddHeader())
     cst_tree = cst_tree.visit(AddImports())
     cst_tree = cst_tree.visit(Annotate())
@@ -221,7 +304,7 @@ def apply_lib3to2_change(code: str) -> str:
 
 
 class BASE64_CONSTS:
-    PY_TYPING = 'ZGVmIF9mKCk6CiAgICBjbGFzcyBfYyhvYmplY3QpOgogICAgICAgIGRlZiBfX2luaXRfXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOgogICAgICAgICAgICBwYXNzCiAgICAgICAgZGVmIF9fY2FsbF9fKHNlbGYsICphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgICAgIHJldHVybiBfYwogICAgICAgIGRlZiBfX2dldGl0ZW1fXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOgogICAgICAgICAgICByZXR1cm4gX2MKICAgIHJldHVybiBfYygpCgoKQW5ub3RhdGVkPV9mKCkKQW55PV9mKCkKQ2FsbGFibGU9X2YoKQpDbGFzc1Zhcj1fZigpCkNvbmNhdGVuYXRlPV9mKCkKRmluYWw9X2YoKQpGb3J3YXJkUmVmPV9mKCkKR2VuZXJpYz1fZigpCkxpdGVyYWw9X2YoKQpPcHRpb25hbD1fZigpClBhcmFtU3BlYz1fZigpClByb3RvY29sPV9mKCkKVHVwbGU9X2YoKQpUeXBlPV9mKCkKVHlwZVZhcj1fZigpClVuaW9uPV9mKCkKQWJzdHJhY3RTZXQ9X2YoKQpCeXRlU3RyaW5nPV9mKCkKQ29udGFpbmVyPV9mKCkKQ29udGV4dE1hbmFnZXI9X2YoKQpIYXNoYWJsZT1fZigpCkl0ZW1zVmlldz1fZigpCkl0ZXJhYmxlPV9mKCkKSXRlcmF0b3I9X2YoKQpLZXlzVmlldz1fZigpCk1hcHBpbmc9X2YoKQpNYXBwaW5nVmlldz1fZigpCk11dGFibGVNYXBwaW5nPV9mKCkKTXV0YWJsZVNlcXVlbmNlPV9mKCkKTXV0YWJsZVNldD1fZigpClNlcXVlbmNlPV9mKCkKU2l6ZWQ9X2YoKQpWYWx1ZXNWaWV3PV9mKCkKQXdhaXRhYmxlPV9mKCkKQXN5bmNJdGVyYXRvcj1fZigpCkFzeW5jSXRlcmFibGU9X2YoKQpDb3JvdXRpbmU9X2YoKQpDb2xsZWN0aW9uPV9mKCkKQXN5bmNHZW5lcmF0b3I9X2YoKQpBc3luY0NvbnRleHRNYW5lcj1fZigpClJldmVyc2libGU9X2YoKQpTdXBwb3J0c0Ficz1fZigpClN1cHBvcnRzQnl0ZXM9X2YoKQpTdXBwb3J0c0NvbXBsZXg9X2YoKQpTdXBwb3J0c0Zsb2F0PV9mKCkKU3VwcG9ydHNJbmRleD1fZigpClN1cHBvcnRzSW50PV9mKCkKU3VwcG9ydHNSb3VuZD1fZigpCkNoYWluTWFwPV9mKCkKQ291bnRlcj1fZigpCkRlcXVlPV9mKCkKRGljdD1fZigpCkRlZmF1bHREaWN0PV9mKCkKTGlzdD1fZigpCk9yZGVyZWREaWN0PV9mKCkKU2V0PV9mKCkKRnJvemVuU2V0PV9mKCkKTmFtZWRUdXBsZT1fZigpClR5cGVkRGljdD1fZigpCkdlbmVyYXRvcj1fZigpCkJpbmFyeUlPPV9mKCkKSU89X2YoKQpNYXRjaD1fZigpClBhdHRlcm49X2YoKQpUZXh0SU89X2YoKQpBbnlTdHI9X2YoKQpjYXN0PV9mKCkKZmluYWw9X2YoKQpnZXRfYXJncz1fZigpCmdldF9vcmlnaW49X2YoKQpnZXRfdHlwZV9oaW50cz1fZigpCmlzX3R5cGVkZGljdD1fZigpCk5ld1R5cGU9X2YoKQpub190eXBlX2NoZWNrPV9mKCkKbm9fdHlwZV9jaGVja19kb3JhdG89X2YoKQpOb1JldHVybj1fZigpCm92ZXJsb2FkPV9mKCkKUGFyYW1TcGVjQXJncz1fZigpClBhcmFtU3BlY0t3YXJncz1fZigpCnJ1bnRpbWVfY2hlY2thYj1fZigpClRleHQ9X2YoKQpUWVBFX0NIRUNLSU5HPV9mKCkKVHlwZUFsaWFzPV9mKCkKVHlwZUd1YXJkPV9mKCk='
-    PY_TYPING_EXTENSION = 'ZGVmIF9mKCk6DQogICAgY2xhc3MgX2Mob2JqZWN0KToNCiAgICAgICAgZGVmIF9faW5pdF9fKHNlbGYsICphcmdzLCAqKmt3YXJncyk6DQogICAgICAgICAgICBwYXNzDQogICAgICAgIGRlZiBfX2NhbGxfXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOg0KICAgICAgICAgICAgcmV0dXJuIF9jDQogICAgICAgIGRlZiBfX2dldGl0ZW1fXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOg0KICAgICAgICAgICAgcmV0dXJuIF9jDQogICAgcmV0dXJuIF9jKCkNCkNsYXNzVmFyPV9mKCkNCkNvbmNhdGVuYXRlPV9mKCkNCkZpbmFsPV9mKCkNCkxpdGVyYWxTdHJpbmc9X2YoKQ0KUGFyYW1TcGVjPV9mKCkNClBhcmFtU3BlY0FyZ3M9X2YoKQ0KUGFyYW1TcGVjS3dhcmdzPV9mKCkNClNlbGY9X2YoKQ0KVHlwZT1fZigpDQpUeXBlVmFyVHVwbGU9X2YoKQ0KVW5wYWNrPV9mKCkNCkF3YWl0YWJsZT1fZigpDQpBc3luY0l0ZXJhdG9yPV9mKCkNCkFzeW5jSXRlcmFibGU9X2YoKQ0KQ29yb3V0aW5lPV9mKCkNCkFzeW5jR2VuZXJhdG9yPV9mKCkNCkFzeW5jQ29udGV4dE1hbj1fZigpDQpDaGFpbk1hcD1fZigpDQpDb250ZXh0TWFuYWdlcj1fZigpDQpDb3VudGVyPV9mKCkNCkRlcXVlPV9mKCkNCkRlZmF1bHREaWN0PV9mKCkNCk9yZGVyZWREaWN0PV9mKCkNClR5cGVkRGljdD1fZigpDQpTdXBwb3J0c0luZGV4PV9mKCkNCkFubm90YXRlZD1fZigpDQphc3NlcnRfbmV2ZXI9X2YoKQ0KYXNzZXJ0X3R5cGU9X2YoKQ0KY2xlYXJfb3ZlcmxvYWRzPV9mKCkNCmRhdGFjbGFzc190cmFucz1fZigpDQpnZXRfb3ZlcmxvYWRzPV9mKCkNCmZpbmFsPV9mKCkNCmdldF9hcmdzPV9mKCkNCmdldF9vcmlnaW49X2YoKQ0KZ2V0X3R5cGVfaGludHM9X2YoKQ0KSW50VmFyPV9mKCkNCmlzX3R5cGVkZGljdD1fZigpDQpMaXRlcmFsPV9mKCkNCk5ld1R5cGU9X2YoKQ0Kb3ZlcmxvYWQ9X2YoKQ0KUHJvdG9jb2w9X2YoKQ0KcmV2ZWFsX3R5cGU9X2YoKQ0KcnVudGltZT1fZigpDQpydW50aW1lX2NoZWNrYWI9X2YoKQ0KVGV4dD1fZigpDQpUeXBlQWxpYXM9X2YoKQ0KVHlwZUd1YXJkPV9mKCkNClRZUEVfQ0hFQ0tJTkc9X2YoKQ0KTmV2ZXI9X2YoKQ0KTm9SZXR1cm49X2YoKQ0KUmVxdWlyZWQ9X2YoKQ0KTm90UmVxdWlyZWQ9X2YoKQ=='
+    PY_TYPING = 'ZGVmIF9mKCk6CiAgICBjbGFzcyBfYyhvYmplY3QpOgogICAgICAgIGRlZiBfX2luaXRfXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOgogICAgICAgICAgICBwYXNzCiAgICAgICAgZGVmIF9fY2FsbF9fKHNlbGYsICphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgICAgIHJldHVybiBfYwogICAgICAgIGRlZiBfX2dldGl0ZW1fXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOgogICAgICAgICAgICByZXR1cm4gX2MKICAgIHJldHVybiBfYwpBbm5vdGF0ZWQ9X2YoKQpBbnk9X2YoKQpDYWxsYWJsZT1fZigpCkNsYXNzVmFyPV9mKCkKQ29uY2F0ZW5hdGU9X2YoKQpGaW5hbD1fZigpCkZvcndhcmRSZWY9X2YoKQpHZW5lcmljPV9mKCkKTGl0ZXJhbD1fZigpCk9wdGlvbmFsPV9mKCkKUGFyYW1TcGVjPV9mKCkKUHJvdG9jb2w9X2YoKQpUdXBsZT1fZigpClR5cGU9X2YoKQpUeXBlVmFyPV9mKCkKVW5pb249X2YoKQpBYnN0cmFjdFNldD1fZigpCkJ5dGVTdHJpbmc9X2YoKQpDb250YWluZXI9X2YoKQpDb250ZXh0TWFuYWdlcj1fZigpCkhhc2hhYmxlPV9mKCkKSXRlbXNWaWV3PV9mKCkKSXRlcmFibGU9X2YoKQpJdGVyYXRvcj1fZigpCktleXNWaWV3PV9mKCkKTWFwcGluZz1fZigpCk1hcHBpbmdWaWV3PV9mKCkKTXV0YWJsZU1hcHBpbmc9X2YoKQpNdXRhYmxlU2VxdWVuY2U9X2YoKQpNdXRhYmxlU2V0PV9mKCkKU2VxdWVuY2U9X2YoKQpTaXplZD1fZigpClZhbHVlc1ZpZXc9X2YoKQpBd2FpdGFibGU9X2YoKQpBc3luY0l0ZXJhdG9yPV9mKCkKQXN5bmNJdGVyYWJsZT1fZigpCkNvcm91dGluZT1fZigpCkNvbGxlY3Rpb249X2YoKQpBc3luY0dlbmVyYXRvcj1fZigpCkFzeW5jQ29udGV4dE1hbmVyPV9mKCkKUmV2ZXJzaWJsZT1fZigpClN1cHBvcnRzQWJzPV9mKCkKU3VwcG9ydHNCeXRlcz1fZigpClN1cHBvcnRzQ29tcGxleD1fZigpClN1cHBvcnRzRmxvYXQ9X2YoKQpTdXBwb3J0c0luZGV4PV9mKCkKU3VwcG9ydHNJbnQ9X2YoKQpTdXBwb3J0c1JvdW5kPV9mKCkKQ2hhaW5NYXA9X2YoKQpDb3VudGVyPV9mKCkKRGVxdWU9X2YoKQpEaWN0PV9mKCkKRGVmYXVsdERpY3Q9X2YoKQpMaXN0PV9mKCkKT3JkZXJlZERpY3Q9X2YoKQpTZXQ9X2YoKQpGcm96ZW5TZXQ9X2YoKQpOYW1lZFR1cGxlPV9mKCkKVHlwZWREaWN0PV9mKCkKR2VuZXJhdG9yPV9mKCkKQmluYXJ5SU89X2YoKQpJTz1fZigpCk1hdGNoPV9mKCkKUGF0dGVybj1fZigpClRleHRJTz1fZigpCkFueVN0cj1fZigpCmNhc3Q9X2YoKQpmaW5hbD1fZigpCmdldF9hcmdzPV9mKCkKZ2V0X29yaWdpbj1fZigpCmdldF90eXBlX2hpbnRzPV9mKCkKaXNfdHlwZWRkaWN0PV9mKCkKTmV3VHlwZT1fZigpCm5vX3R5cGVfY2hlY2s9X2YoKQpub190eXBlX2NoZWNrX2RvcmF0bz1fZigpCk5vUmV0dXJuPV9mKCkKb3ZlcmxvYWQ9X2YoKQpQYXJhbVNwZWNBcmdzPV9mKCkKUGFyYW1TcGVjS3dhcmdzPV9mKCkKcnVudGltZV9jaGVja2FiPV9mKCkKVGV4dD1fZigpClRZUEVfQ0hFQ0tJTkc9X2YoKQpUeXBlQWxpYXM9X2YoKQpUeXBlR3VhcmQ9X2YoKQ=='
+    PY_TYPING_EXTENSION = 'ZGVmIF9mKCk6CiAgICBjbGFzcyBfYyhvYmplY3QpOgogICAgICAgIGRlZiBfX2luaXRfXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOgogICAgICAgICAgICBwYXNzCiAgICAgICAgZGVmIF9fY2FsbF9fKHNlbGYsICphcmdzLCAqKmt3YXJncyk6CiAgICAgICAgICAgIHJldHVybiBfYwogICAgICAgIGRlZiBfX2dldGl0ZW1fXyhzZWxmLCAqYXJncywgKiprd2FyZ3MpOgogICAgICAgICAgICByZXR1cm4gX2MKICAgIHJldHVybiBfYwpDbGFzc1Zhcj1fZigpCkNvbmNhdGVuYXRlPV9mKCkKRmluYWw9X2YoKQpMaXRlcmFsU3RyaW5nPV9mKCkKUGFyYW1TcGVjPV9mKCkKUGFyYW1TcGVjQXJncz1fZigpClBhcmFtU3BlY0t3YXJncz1fZigpClNlbGY9X2YoKQpUeXBlPV9mKCkKVHlwZVZhclR1cGxlPV9mKCkKVW5wYWNrPV9mKCkKQXdhaXRhYmxlPV9mKCkKQXN5bmNJdGVyYXRvcj1fZigpCkFzeW5jSXRlcmFibGU9X2YoKQpDb3JvdXRpbmU9X2YoKQpBc3luY0dlbmVyYXRvcj1fZigpCkFzeW5jQ29udGV4dE1hbj1fZigpCkNoYWluTWFwPV9mKCkKQ29udGV4dE1hbmFnZXI9X2YoKQpDb3VudGVyPV9mKCkKRGVxdWU9X2YoKQpEZWZhdWx0RGljdD1fZigpCk9yZGVyZWREaWN0PV9mKCkKVHlwZWREaWN0PV9mKCkKU3VwcG9ydHNJbmRleD1fZigpCkFubm90YXRlZD1fZigpCmFzc2VydF9uZXZlcj1fZigpCmFzc2VydF90eXBlPV9mKCkKY2xlYXJfb3ZlcmxvYWRzPV9mKCkKZGF0YWNsYXNzX3RyYW5zPV9mKCkKZ2V0X292ZXJsb2Fkcz1fZigpCmZpbmFsPV9mKCkKZ2V0X2FyZ3M9X2YoKQpnZXRfb3JpZ2luPV9mKCkKZ2V0X3R5cGVfaGludHM9X2YoKQpJbnRWYXI9X2YoKQppc190eXBlZGRpY3Q9X2YoKQpMaXRlcmFsPV9mKCkKTmV3VHlwZT1fZigpCm92ZXJsb2FkPV9mKCkKUHJvdG9jb2w9X2YoKQpyZXZlYWxfdHlwZT1fZigpCnJ1bnRpbWU9X2YoKQpydW50aW1lX2NoZWNrYWI9X2YoKQpUZXh0PV9mKCkKVHlwZUFsaWFzPV9mKCkKVHlwZUd1YXJkPV9mKCkKVFlQRV9DSEVDS0lORz1fZigpCk5ldmVyPV9mKCkKTm9SZXR1cm49X2YoKQpSZXF1aXJlZD1fZigpCk5vdFJlcXVpcmVkPV9mKCk='
 
 
