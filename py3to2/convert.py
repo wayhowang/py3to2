@@ -1,3 +1,4 @@
+from tokenize import Name
 from typing import *
 import libcst as cst
 import libcst.metadata as cstmeta
@@ -27,14 +28,14 @@ class AddHeader(cst.CSTTransformer):
         self, original_node: cst.Module, updated_node: cst.Module
     ):
         stmt = cst.EmptyLine(indent=False, comment=cst.Comment('# coding: utf8'))
-        return updated_node.with_changes(header = (stmt, ) + updated_node.header)
+        return updated_node.with_changes(header = (stmt, ) + tuple(updated_node.header))
 
 class AddImports(cst.CSTTransformer):
     def leave_Module(
         self, original_node: cst.Module, updated_node: cst.Module
     ):
-        stmt = cst.parse_statement('from __future__ import absolute_import, division, print_function, unicode_literals')
-        return updated_node.with_changes(body = (stmt, ) + updated_node.body)
+        stmt1 = cst.parse_statement('from __future__ import absolute_import, division, print_function, unicode_literals')
+        return updated_node.with_changes(body = (stmt1, ) + tuple(updated_node.body))
 
 class Annotate(cst.CSTTransformer):
     def leave_SimpleStatementLine(
@@ -60,6 +61,10 @@ class RemoveTypehint(cst.CSTTransformer):
         'typing_extensions': '_py3to2_typing_extensions'
     }
 
+    def __init__(self, relative_dots: int):
+        super().__init__()
+        self._relative_dots = relative_dots
+
     # ==========================================
     # 删除变量、参数、函数的类型提示
 
@@ -80,21 +85,61 @@ class RemoveTypehint(cst.CSTTransformer):
     # =========================================
     # 删除和 typing 相关的 import
 
-    def leave_ImportAlias(self, original_node: cst.ImportAlias, updated_node: cst.ImportAlias) -> cst.ImportAlias:
-        new_import_name = RemoveTypehint.REPLACE_MAPPING.get(updated_node.name.value)
-        if new_import_name is not None:
-            return updated_node.with_deep_changes(updated_node.name, value=new_import_name)
-        else:
-            return updated_node
+    def leave_Import(self, original_node: cst.Import, updated_node: cst.Import) -> Union[cst.BaseSmallStatement, cst.FlattenSentinel[cst.BaseSmallStatement], cst.RemovalSentinel]:
+        imports = list(updated_node.names)
+        new_imports = []
+        replaced_imports: List[cst.BaseSmallStatement] = []
+        for import_alias in imports:    
+            if import_alias.name is None:
+                new_imports.append(import_alias)
+                continue
+
+            new_import_name = RemoveTypehint.REPLACE_MAPPING.get(str(import_alias.name.value))
+            if new_import_name is None:
+                new_imports.append(import_alias.with_changes(comma=cst.MaybeSentinel.DEFAULT))
+                continue
+                
+            replaced_imports.append(cst.ImportFrom(
+                module=None,
+                relative=[cst.Dot() for _ in range(self._relative_dots)],
+                names=[import_alias.with_changes(name=cst.Name(value=new_import_name), comma=cst.MaybeSentinel.DEFAULT)],
+                semicolon=cst.MaybeSentinel.DEFAULT
+            ))
+
+        stmts = replaced_imports
+        if new_imports:
+            stmts.append(updated_node.with_changes(names=new_imports))
+        
+        return cst.FlattenSentinel(stmts)
 
     def leave_ImportFrom(
         self, original_node: cst.ImportFrom, updated_node: cst.ImportFrom
     ) -> Union[cst.BaseSmallStatement, cst.RemovalSentinel]:
-        new_import_name = RemoveTypehint.REPLACE_MAPPING.get(updated_node.module.value)
-        if new_import_name is not None:
-            return updated_node.with_deep_changes(updated_node.module, value=new_import_name)
-        else:
+        if updated_node.module is None:
             return updated_node
+        if updated_node.relative:
+            return updated_node
+        new_import_name = RemoveTypehint.REPLACE_MAPPING.get(str(updated_node.module.value))
+        if new_import_name is not None:
+            out = updated_node.with_deep_changes(
+                updated_node.module, value=new_import_name
+            ).with_changes(
+                relative = [cst.Dot() for _ in range(self._relative_dots)],
+            )
+            return out
+        else:
+            if updated_node.module.value == '__future__':
+                if isinstance(updated_node.names, cst.ImportStar):
+                    return updated_node
+                else:
+                    names = updated_node.names
+                    names = tuple(filter(lambda x: x.name.value != 'annotations', names))
+                    if names:
+                        return updated_node.with_changes(names=names)
+                    else:
+                        return cst.RemovalSentinel.REMOVE
+            else:
+                return updated_node
 
 
 # call after RemoveTypehint
@@ -134,7 +179,13 @@ def pretty_code(module: cst.Module) -> str:
     return module.code
 
 
-def apply_libcst_change(code: str) -> str:
+def get_relative_dots(code_path: str, directory: str) -> int:
+    relpath = os.path.relpath(os.path.abspath(code_path), os.path.abspath(directory))
+    n_dots = len(relpath.replace('\\', '/').split('/'))
+    return n_dots
+
+
+def apply_libcst_change(code: str, code_path: str, module_directory: str) -> str:
     # libcst 提供的 FullyQualifiedNameProvider 不知道怎麽 import 系統庫~ 文檔也不多
     # 内部是通過跨進程調用的方式搞，似乎也不太靠譜，容易出問題
     # 所以先用 jedi 了
@@ -144,7 +195,7 @@ def apply_libcst_change(code: str) -> str:
     # 因为要用 JEDI 的关系，需要保持语法树和源代码一致
     # 当然。。codegen + parse 都走一遍也不是不可以了。。
     # cst_tree = cst.MetadataWrapper(cst_tree)
-    cst_tree = cst_tree.visit(RemoveTypehint())    
+    cst_tree = cst_tree.visit(RemoveTypehint(get_relative_dots(code_path, module_directory)))    
     cst_tree = cst_tree.visit(AddHeader())
     cst_tree = cst_tree.visit(AddImports())
     cst_tree = cst_tree.visit(Annotate())

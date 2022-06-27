@@ -1,10 +1,10 @@
 from .convert import *
 
-def convert_path(source_path: str, target_path: str):
+def convert_path(source_path: str, target_path: str, module_directory: str):
     with open(source_path, 'r', encoding='utf8') as source_f:
         code = source_f.read()
 
-    code = apply_libcst_change(code)
+    code = apply_libcst_change(code, target_path, module_directory)
     code = apply_lib3to2_change(code)
 
     if target_path is None:
@@ -22,8 +22,9 @@ def initialize_directory(target_dir: str):
 def convert(args):
     source_path = args.source
     target_path = args.output
+    module_directory = getattr(args, 'module-directory')
 
-    convert_path(source_path, target_path)
+    convert_path(source_path, target_path, module_directory)
 
 
 def convert_all(args):
@@ -34,7 +35,7 @@ def convert_all(args):
             file: str
             if file.endswith('.py'):
                 io_path = os.path.join(folder, file)
-                convert_path(io_path, io_path)    
+                convert_path(io_path, io_path, directory)    
 
     initialize_directory(directory)
     
@@ -55,8 +56,9 @@ def main():
     subparsers = parser.add_subparsers(required=True)
     
     parser_convert = subparsers.add_parser('convert')
+    parser_convert.add_argument('module-directory', type=str)
     parser_convert.add_argument('source', type=str)
-    parser_convert.add_argument('--output', type=str, required=False)
+    parser_convert.add_argument('output', type=str)
     parser_convert.set_defaults(func=convert)
     
     parser_convert_all = subparsers.add_parser('convert-all')
